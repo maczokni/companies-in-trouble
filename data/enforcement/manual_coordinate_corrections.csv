@@ -1,0 +1,7 @@
+offender,latitude,longitude,reason
+S WALSH AND SON LTD,52.5094852,-1.4890925,Automated geocode for Goldsmith Way CV10 7RJ (Nuneaton) was in the wrong place; corrected manually
+ESSAR OIL (UK)LTD,53.2863245,-2.9540276,Address given as a PO Box; located manually from the postcode CH65 4HB
+Severn Trent Water Ltd,52.4049263,-1.5088909,Ambiguous address (WORCESTER) geocoded outside the UK; corrected manually
+Morgan Stanley Services (UK) Limited,51.5050494,-0.0263146,Address field contained only the company name and geocoded outside the UK; corrected manually
+Estura Limited,51.5120114,-0.1405731,Address on the Isle of Man; located manually at an address in England
+ConocoPhillips Petroleum Co UK Ltd,51.5140185,-0.1582034,Address field contained only a company name; corrected manually

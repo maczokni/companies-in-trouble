@@ -1,0 +1,604 @@
+---
+title: "Companies in Trouble: data preparation and analysis"
+subtitle: "Reproduces every table, figure and statistic reported in the paper"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+format: docx
+editor: visual
+params:
+  # TRUE re-estimates the spatial error model (about 20-30 minutes). FALSE
+  # reuses the cached fit in outputs/cache/ if there is one.
+  refit_spatial_model: false
+  # How enforcement actions are located in England:
+  #   "msoa"               (default) keep every action that falls inside an
+  #                        English MSOA.
+  #   "simplified_england" reproduces the submitted version of the paper,
+  #                        which first filtered actions against an England
+  #                        outline simplified to 10 km. That outline cuts off
+  #                        the coast and drops 42 actions at English addresses
+  #                        (see README, "Known issues").
+  ea_location_filter: "msoa"
+  # TRUE replaces the restricted CCJ data with SIMULATED counts, so that the
+  # code can be run end to end without access to the CDRC data. The results
+  # are then meaningless and are NOT the results in the paper.
+  synthetic_ccj: false
+knit: (function(input, ...) rmarkdown::render(input, output_dir = "outputs", envir = globalenv()))
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7.5, fig.height = 3.6, dpi = 300)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(ggplot2)
+library(patchwork)
+library(bayesiansurpriser)
+library(lme4)
+library(lmerTest)
+library(broom)
+library(broom.mixed)
+library(spdep)
+library(spatialreg)
+library(knitr)
+
+options(scipen = 999)
+set.seed(20151231)   # permutation-based Moran's I tests and synthetic data
+
+stopifnot(params$ea_location_filter %in% c("msoa", "simplified_england"))
+
+# ---- File paths ---------------------------------------------------------------
+paths <- list(
+  ccj           = "../data/E&W 2001-2015/2015/2015 Aggregated Data Corporate.xlsx",   # NOT included
+  msoa_boundary = "../data/BoundaryData/england_msoa_2011.shp",                 # download
+  business_msoa = "data/open/uk_business_counts_msoa_nomis.csv",
+  business_rgn  = "data/open/companies_by_region_2015.csv",
+  imd           = "data/open/imd2015_file1_index_of_multiple_deprivation.xlsx",
+  lsoa_msoa     = "data/open/lsoa11_msoa11_lookup_ew.csv",
+  msoa_lad      = "data/open/msoa11_msoa21_lad22_lookup_ew.csv",
+  lad_rgn       = "data/open/lad22_rgn22_lookup_england.csv",
+  regions       = "data/open/regions_2015/regions_dec2015_ugc_england.shp",
+  countries     = "data/open/countries_dec2021_uk_bgc.geojson",
+  ea            = "data/enforcement/ea_enforcement_actions_2015_2017.csv",
+  cache         = "outputs/cache",
+  tables        = "outputs/tables",
+  figures       = "outputs/figures"
+)
+for (d in c(paths$cache, paths$tables, paths$figures)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Helpers ------------------------------------------------------------------
+# ONS downloads often start with a byte-order mark
+read_csv_bom <- function(path, ...) {
+  x <- read.csv(path, encoding = "UTF-8", check.names = FALSE, ...)
+  names(x)[1] <- sub("^[^A-Za-z0-9]+", "", names(x)[1])
+  x
+}
+
+# Number formatting for tables and text
+f     <- function(x, d = 2) formatC(x, format = "f", digits = d, big.mark = ",")
+fp    <- function(p) ifelse(p < 0.001, "< .001", paste0("= ", sub("^0", "", sprintf("%.3f", p))))
+stars <- function(p) ifelse(p < .001, "***", ifelse(p < .01, "**", ifelse(p < .05, "*", "")))
+save_csv <- function(df, name) {
+  write.csv(df, file.path(paths$tables, paste0(name, ".csv")), row.names = FALSE, fileEncoding = "UTF-8")
+  invisible(df)
+}
+```
+
+```{r synthetic-warning, echo = FALSE, results = "asis"}
+if (params$synthetic_ccj) {
+  cat("<div style='border:3px solid #c00; padding:12px; margin:12px 0; font-weight:bold;'>",
+      "SYNTHETIC DATA: this document was rendered with simulated CCJ counts ",
+      "(params$synthetic_ccj = TRUE). All results involving CCJs or surprise are ",
+      "meaningless and are not the results reported in the paper.</div>")
+}
+```
+
+# About this document
+
+This document reproduces the analysis in *Companies in Trouble*. It runs every step, from the raw files to the tables and figures in the paper: data preparation, the three research questions, and the figures. Tables are also written to `outputs/tables/` as CSV files, and figures to `outputs/figures/` as PDFs.
+
+**Data availability.** All data are included in `data/` or are freely downloadable, **except the county court judgment (CCJ) data**. These were supplied by the Consumer Data Research Centre (now the Geographic Data Service) under a licence that does not allow redistribution. See `data/restricted/README.md` for how to apply for them. To check that the code runs without them, set `synthetic_ccj: true` in the YAML header. This replaces the CCJs with simulated counts.
+
+**Research questions.**
+
+1. Is there a spatial pattern of "companies in trouble" across England?
+2. Is area-level socio-economic deprivation associated with companies in trouble?
+3. Is an area-level measure of companies in trouble associated with regulatory enforcement against companies?
+
+# Data preparation
+
+## MSOA boundaries, business counts and regions
+
+The unit of analysis is the 2011 Middle Layer Super Output Area (MSOA); there are 6,791 in England. The denominator for MSOAs is the number of businesses in ONS UK Business Counts for 2016, the earliest year available at MSOA level. Each MSOA is assigned to one of England's nine regions.
+
+```{r msoa}
+if (!file.exists(paths$msoa_boundary)) {
+  stop("MSOA boundaries not found. See data/boundaries/README.md.", call. = FALSE)
+}
+msoa <- st_read(paths$msoa_boundary, quiet = TRUE)
+
+business <- read_csv_bom(paths$business_msoa) %>%
+  select(mnemonic, n_business = `2016`) %>%
+  mutate(n_business = as.numeric(n_business))
+
+msoa_lad <- read_csv_bom(paths$msoa_lad) %>%
+  distinct(MSOA11CD, .keep_all = TRUE) %>%
+  select(MSOA11CD, MSOA21NM, LAD22CD)
+lad_rgn <- read_csv_bom(paths$lad_rgn) %>% select(LAD22CD, RGN22NM)
+
+msoa_data <- msoa %>%
+  left_join(business, by = c("code" = "mnemonic")) %>%
+  left_join(msoa_lad, by = c("code" = "MSOA11CD")) %>%
+  left_join(lad_rgn, by = "LAD22CD")
+
+stopifnot(nrow(msoa_data) == 6791, !anyNA(msoa_data$n_business), !anyNA(msoa_data$RGN22NM))
+```
+
+## County court judgments (restricted)
+
+The CCJ data are the CDRC *County Court Judgments – Corporate Debt, 2015* aggregated workbook. It covers judgments against companies (public and private limited companies) and excludes sole traders and the self-employed. Each sheet has eight rows of metadata. Row 7 holds the column names, and the data start in row 9.
+
+**Deriving the number of CCJs.** For disclosure control, CDRC rounds counts up to multiples of five, which inflates small counts. The total and average values of judgments are not rounded, so we calculate the number of CCJs in each area as total value divided by average value.
+
+**A duplicate MSOA.** MSOA E02001166 appears twice in the file, under Manchester and under Salford, with different values. ONS assigns it to Salford, so we keep only the Salford record.
+
+```{r ccj}
+read_cdrc_sheet <- function(path, sheet) {
+  raw <- read_xlsx(path, sheet = sheet, col_names = FALSE, .name_repair = "minimal")
+  header <- as.character(unlist(raw[7, ]))
+  measure_cols <- which(header == "DATA_VALUE")
+  geo_cols <- which(!is.na(header) & header != "DATA_VALUE")
+  stopifnot(length(measure_cols) == 7)
+  out <- raw[-(1:8), c(geo_cols, measure_cols)]
+  names(out) <- c(tolower(header[geo_cols]),
+                  "total_ccjs", "total_value", "average_value",
+                  "n_lt250", "n_lt500", "n_lt1000", "n_gt1000")
+  out %>%
+    filter(!is.na(.data[[names(out)[1]]])) %>%
+    mutate(across(total_ccjs:n_gt1000, as.numeric),
+           n_ccj = ifelse(average_value > 0, total_value / average_value, 0))
+}
+
+if (params$synthetic_ccj) {
+  # Simulated counts: Poisson, proportional to businesses, scaled to the
+  # England total in the paper (41,402), with extra between-area variation.
+  rate <- 41402 / sum(msoa_data$n_business)
+  ccj_msoa <- tibble(msoa_code = msoa_data$code,
+                     n_ccj = rpois(nrow(msoa_data),
+                                   msoa_data$n_business * rate * rgamma(nrow(msoa_data), 2, 2)))
+  ccj_region <- msoa_data %>% st_drop_geometry() %>%
+    mutate(n_ccj = ccj_msoa$n_ccj) %>%
+    group_by(gor_name = RGN22NM) %>% summarise(n_ccj = sum(n_ccj), .groups = "drop")
+} else {
+  if (!file.exists(paths$ccj)) {
+    stop("CCJ data not found at '", paths$ccj, "'. These data cannot be ",
+         "redistributed; see data/restricted/README.md, or set synthetic_ccj: true ",
+         "to run the code with simulated data.", call. = FALSE)
+  }
+  ccj_msoa <- read_cdrc_sheet(paths$ccj, "MSOA") %>%
+    filter(msoa_code != "N99999999") %>%                    # Northern Ireland placeholder
+    distinct() %>%
+    filter(!(msoa_code == "E02001166" & la_name == "Manchester"))
+  ccj_region <- read_cdrc_sheet(paths$ccj, "GOR") %>% select(gor_name, n_ccj)
+}
+stopifnot(!any(duplicated(ccj_msoa$msoa_code)))
+
+msoa_data <- msoa_data %>%
+  left_join(ccj_msoa %>% select(msoa_code, n_ccj), by = c("code" = "msoa_code")) %>%
+  mutate(n_ccj = replace_na(n_ccj, 0),          # no record = no CCJs
+         ccj_rate = n_ccj / n_business * 100)   # per 100 businesses
+```
+
+## Deprivation
+
+Deprivation is measured with the English Index of Multiple Deprivation (IMD) 2015, which is published for Lower Layer Super Output Areas (LSOAs). Following the ONS approach for larger areas, we calculate the percentage of each MSOA's LSOAs that fall in the 20% most deprived nationally (IMD deciles 1 and 2). It enters every model per 10 percentage points (`dep_10`).
+
+```{r deprivation}
+imd <- read_xlsx(paths$imd, sheet = "IMD 2015")
+names(imd)[c(1, 6)] <- c("lsoa_code", "imd_decile")
+lsoa_msoa <- read_csv_bom(paths$lsoa_msoa) %>% distinct(LSOA11CD, MSOA11CD)
+
+deprivation <- imd %>%
+  select(lsoa_code, imd_decile) %>%
+  left_join(lsoa_msoa, by = c("lsoa_code" = "LSOA11CD")) %>%
+  group_by(MSOA11CD) %>%
+  summarise(dep_pct = mean(imd_decile %in% c(1, 2)) * 100, .groups = "drop") %>%
+  mutate(dep_10 = dep_pct / 10)
+
+msoa_data <- msoa_data %>% left_join(deprivation, by = c("code" = "MSOA11CD"))
+stopifnot(!anyNA(msoa_data$dep_pct))
+```
+
+## Bayesian surprise
+
+Counts of CCJs mostly show where companies are, and rates are unstable where there are few companies. Bayesian surprise (Correll and Heer, 2017) measures how far the observed counts depart from what we would expect. Here the expected number of CCJs in each area is proportional to its number of businesses. We use the default model space of the `bayesiansurpriser` package, which combines a uniform model, this base-rate model and a de Moivre funnel model. The funnel model allows for the greater variability expected where there are few businesses. Signed surprise is positive where an area has more CCJs than expected and negative where it has fewer. It is our measure of companies in trouble throughout.
+
+```{r surprise}
+msoa_data <- surprise(msoa_data, observed = n_ccj, expected = n_business)
+```
+
+## Environment Agency enforcement actions
+
+
+```{r enforcement}
+ea <- read.csv(paths$ea)
+
+ea_sf <- ea %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(st_crs(msoa_data))
+
+ea_sf <- st_filter(ea_sf, msoa, .predicate = st_within)
+
+ea_in_msoa <- st_join(ea_sf, msoa_data %>% select(code), left = FALSE)
+ea_per_msoa <- ea_in_msoa %>% st_drop_geometry() %>% count(code, name = "ea_enforcements")
+
+msoa_data <- msoa_data %>%
+  left_join(ea_per_msoa, by = "code") %>%
+  mutate(ea_enforcements   = replace_na(ea_enforcements, 0),
+         ea_any            = as.integer(ea_enforcements > 0),
+         surprise_positive = as.integer(signed_surprise > 0),
+         RGN22NM           = relevel(factor(RGN22NM), ref = "London"))
+```
+The enforcement dataset was compiled for this study. It contains `r nrow(ea_sf)` enforcement actions against companies, 2015–2017, from the Environment Agency enforcement database and Violation Tracker UK, geocoded at postcode level. Appendix A and `data/enforcement/README.md` describe how it was built.
+
+Each action is assigned to the MSOA it falls in. Actions outside England's MSOAs, mostly in Wales, are dropped.
+
+## Regions
+
+For Table 1 and Figure 1 we use England's nine regions. The CCJ counts come from the CDRC regional sheet. The denominator is the number of enterprises with the legal status of a company in 2015, from ONS *UK business: activity, size and location* (UK Business Entities).
+
+```{r regions}
+regions <- st_read(paths$regions, quiet = TRUE) %>%
+  left_join(ccj_region, by = c("rgn15nm" = "gor_name")) %>%
+  left_join(read.csv(paths$business_rgn), by = c("rgn15nm" = "region")) %>%
+  mutate(rate_per_10k = n_ccj / companies_2015 * 10000)
+stopifnot(nrow(regions) == 9, !anyNA(regions$n_ccj), !anyNA(regions$companies_2015))
+regions <- surprise(regions, observed = n_ccj, expected = companies_2015)
+```
+
+## Spatial weights
+
+Queen contiguity: MSOAs that share a border or a corner are neighbours. Building the neighbours list from the full-resolution boundaries takes a few minutes, so it is cached.
+
+```{r weights}
+nb_file <- file.path(paths$cache, "nb_queen.rds")
+if (file.exists(nb_file)) {
+  nb <- readRDS(nb_file)
+  stopifnot(identical(attr(nb, "msoa_codes"), msoa_data$code))
+} else {
+  nb <- poly2nb(msoa_data, queen = TRUE)
+  attr(nb, "msoa_codes") <- msoa_data$code
+  saveRDS(nb, nb_file)
+}
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+```
+
+# Descriptive statistics
+
+```{r descriptives}
+n_msoa <- nrow(msoa_data)
+ss <- msoa_data$signed_surprise
+yr <- substr(ea_in_msoa$action_date, 1, 4)
+
+descriptives <- tibble(
+  statistic = c("MSOAs", "CCJs against companies", "Mean CCJs per MSOA", "Median", "SD", "Maximum",
+                "MSOAs with no CCJs", "% MSOAs with no CCJs",
+                "Signed surprise: min", "max", "mean", "SD", "% MSOAs with positive surprise",
+                "Deprivation (% LSOAs in most deprived 20%): mean", "SD",
+                "% MSOAs with no deprived LSOAs",
+                "Enforcement actions in dataset", "Enforcement actions located in English MSOAs",
+                "  in 2015", "  in 2016", "  in 2017",
+                "MSOAs with at least one action", "% MSOAs with no action",
+                "% MSOAs with one action", "% MSOAs with more than one action"),
+  value = c(n_msoa, sum(msoa_data$n_ccj), mean(msoa_data$n_ccj), median(msoa_data$n_ccj),
+            sd(msoa_data$n_ccj), max(msoa_data$n_ccj),
+            sum(msoa_data$n_ccj == 0), mean(msoa_data$n_ccj == 0) * 100,
+            min(ss), max(ss), mean(ss), sd(ss), mean(ss > 0) * 100,
+            mean(msoa_data$dep_pct), sd(msoa_data$dep_pct), mean(msoa_data$dep_pct == 0) * 100,
+            nrow(ea), nrow(ea_in_msoa), sum(yr == "2015"), sum(yr == "2016"), sum(yr == "2017"),
+            sum(msoa_data$ea_any), mean(msoa_data$ea_enforcements == 0) * 100,
+            mean(msoa_data$ea_enforcements == 1) * 100, mean(msoa_data$ea_enforcements > 1) * 100)
+)
+save_csv(descriptives %>% mutate(value = round(value, 3)), "descriptives")
+descriptives %>% mutate(value = f(value, 2))
+```
+
+# RQ1: The spatial pattern of companies in trouble
+
+## Table 1 and Figure 1: regions
+
+```{r table1}
+tab1 <- regions %>% st_drop_geometry() %>% arrange(desc(signed_surprise > 0), rgn15nm)
+table1 <- bind_rows(
+  tab1 %>% transmute(Region = rgn15nm, CCJs = f(n_ccj, 0), Companies = f(companies_2015, 0),
+                     `CCJs per 10,000 companies` = f(rate_per_10k, 0),
+                     `Expected CCJs` = f(sum(as.numeric(n_ccj)) * companies_2015 / sum(as.numeric(companies_2015)), 0),
+                     `Signed surprise` = f(signed_surprise, 2)),
+  tibble(Region = "England", CCJs = f(sum(tab1$n_ccj), 0), Companies = f(sum(tab1$companies_2015), 0),
+         `CCJs per 10,000 companies` = f(sum(tab1$n_ccj) / sum(tab1$companies_2015) * 1e4, 0),
+         `Expected CCJs` = "", `Signed surprise` = ""))
+save_csv(table1, "table1_ccjs_by_region")
+kable(table1, align = "lrrrrr", caption = "Table 1. CCJs against companies by region, England, 2015.")
+```
+
+```{r map-helper}
+map_panel <- function(data, fill, title, legend_title, linewidth = 0.2) {
+  ggplot(data) +
+    geom_sf(aes(fill = {{ fill }}), colour = "grey30", linewidth = linewidth) +
+    scale_fill_surprise_diverging(name = legend_title) +
+    labs(title = title) +
+    guides(fill = guide_colourbar(title.position = "top", title.hjust = 0.5,
+                                  barwidth = unit(3.8, "cm"), barheight = unit(0.25, "cm"))) +
+    theme_void(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", size = 9),
+          legend.position = "bottom",
+          legend.title = element_text(size = 7.5),
+          legend.text = element_text(size = 6.5),
+          plot.margin = margin(4, 4, 4, 4))
+}
+```
+
+```{r figure1, fig.cap = "Figure 1. CCJs against companies by region, England, 2015: (a) count, (b) rate per 10,000 companies, (c) signed Bayesian surprise."}
+fig1 <- list(
+  count    = map_panel(regions, n_ccj, "(a) Count", "CCJs"),
+  rate     = map_panel(regions, rate_per_10k, "(b) Rate", "CCJs per 10,000 companies"),
+  surprise = map_panel(regions, signed_surprise, "(c) Signed Bayesian surprise", "Signed surprise"))
+wrap_plots(fig1, nrow = 1)
+```
+
+## Table 2 and Figure 2: MSOAs
+
+```{r table2}
+tab2 <- msoa_data %>% st_drop_geometry() %>%
+  group_by(Region = as.character(RGN22NM)) %>%
+  summarise(MSOAs = n(), mean_s = mean(signed_surprise), pos = mean(signed_surprise > 0) * 100,
+            dep = mean(dep_pct), .groups = "drop") %>%
+  arrange(desc(mean_s))
+table2 <- bind_rows(
+  tab2 %>% transmute(Region, MSOAs = f(MSOAs, 0), `Mean signed surprise` = f(mean_s, 3),
+                     `MSOAs with more CCJs than expected (%)` = f(pos, 1),
+                     `Mean % deprived LSOAs` = f(dep, 1)),
+  tibble(Region = "England", MSOAs = f(n_msoa, 0), `Mean signed surprise` = f(mean(ss), 3),
+         `MSOAs with more CCJs than expected (%)` = f(mean(ss > 0) * 100, 1),
+         `Mean % deprived LSOAs` = f(mean(msoa_data$dep_pct), 1)))
+save_csv(table2, "table2_msoa_surprise_by_region")
+kable(table2, align = "lrrrr", caption = "Table 2. Signed surprise and deprivation in MSOAs, by region.")
+
+kw <- kruskal.test(signed_surprise ~ RGN22NM, data = msoa_data)
+save_csv(tibble(chi_squared = unname(kw$statistic), df = unname(kw$parameter), p = kw$p.value),
+         "rq1_kruskal_wallis")
+```
+
+Signed surprise differs across regions: Kruskal–Wallis χ²(`r kw$parameter`) = `r f(kw$statistic, 1)`, p `r fp(kw$p.value)`.
+
+```{r figure2, fig.height = 3.0, fig.cap = "Figure 2. CCJs against companies in London MSOAs, 2015: (a) count, (b) rate per 100 businesses, (c) signed Bayesian surprise."}
+london <- msoa_data %>% filter(RGN22NM == "London") %>%
+  st_simplify(preserveTopology = TRUE, dTolerance = 10)   # for plotting only
+fig2 <- list(
+  count    = map_panel(london, n_ccj, "(a) Count", "CCJs", 0.05),
+  rate     = map_panel(london, ccj_rate, "(b) Rate", "CCJs per 100 businesses", 0.05),
+  surprise = map_panel(london, signed_surprise, "(c) Signed Bayesian surprise", "Signed surprise", 0.05))
+wrap_plots(fig2, nrow = 1)
+```
+
+# RQ2: Deprivation and companies in trouble
+
+**Main model.** We regress signed surprise on deprivation, with region fixed effects. Region is fixed rather than random because nine regions are too few to estimate a between-region variance reliably (McNeish and Stapleton, 2016), and because the regional contrasts are of substantive interest. The residuals are spatially autocorrelated, so the main model is a spatial error model with the same specification (Model 2). Model 1 is the same model without the spatial error term.
+
+**Checks.** We fit a linear mixed model with a random intercept for region. Because signed surprise is bimodal, we also fit a logistic mixed model of whether surprise is positive or negative. We test spatial autocorrelation with Moran's I on the residuals of the linear mixed model.
+
+```{r rq2-models}
+# Model 1: OLS with region fixed effects
+m_ols <- lm(signed_surprise ~ dep_10 + RGN22NM, data = msoa_data)
+
+# Model 2 (main): spatial error model with region fixed effects (slow; cached)
+sem_file <- file.path(paths$cache, "sem_dep10.rds")
+if (params$refit_spatial_model || !file.exists(sem_file) || params$synthetic_ccj) {
+  m_sem <- errorsarlm(signed_surprise ~ dep_10 + RGN22NM, data = msoa_data,
+                      listw = lw, zero.policy = TRUE)
+  if (!params$synthetic_ccj) saveRDS(m_sem, sem_file)
+} else {
+  m_sem <- readRDS(sem_file)
+}
+m_sem_s <- summary(m_sem)
+
+# Checks: linear mixed model and logistic mixed model, random intercept for region
+m_lmm   <- lmerTest::lmer(signed_surprise ~ dep_10 + (1 | RGN22NM), data = msoa_data)
+m_logit <- glmer(surprise_positive ~ dep_10 + (1 | RGN22NM), family = binomial, data = msoa_data)
+
+# Spatial autocorrelation in the residuals of the linear mixed model
+moran_lmm <- moran.mc(residuals(m_lmm), lw, nsim = 999, zero.policy = TRUE)
+
+icc <- function(model, resid_var) {
+  v <- as.data.frame(VarCorr(model))$vcov[1]
+  v / (v + resid_var)
+}
+icc_lmm   <- icc(m_lmm, sigma(m_lmm)^2)
+icc_logit <- icc(m_logit, pi^2 / 3)
+```
+
+```{r table3}
+t_ols <- tidy(m_ols)
+t_sem <- as.data.frame(m_sem_s$Coef) %>% tibble::rownames_to_column("term") %>%
+  rename(estimate = Estimate, std.error = `Std. Error`, p.value = `Pr(>|z|)`)
+cell <- function(d, term) {
+  r <- d[d$term == term, ]
+  paste0(f(r$estimate, 3), " (", f(r$std.error, ifelse(r$std.error < 0.01, 4, 3)), ")", stars(r$p.value))
+}
+reg_order <- c("North East", "North West", "Yorkshire and The Humber", "West Midlands",
+               "East Midlands", "East of England", "South East", "South West")
+rows <- c("dep_10", paste0("RGN22NM", reg_order))
+
+table3 <- tibble(
+  ` ` = c("Deprivation (per 10 percentage points)", paste0("Region: ", reg_order),
+          "Spatial error parameter (lambda)", "AIC"),
+  `Model 1: OLS, region fixed effects` =
+    c(sapply(rows, cell, d = t_ols), "", f(AIC(m_ols), 0)),
+  `Model 2 (main): spatial error model, region fixed effects` =
+    c(sapply(rows, cell, d = t_sem),
+      paste0(f(m_sem$lambda), " (", f(m_sem$lambda.se, 3), ")", stars(m_sem_s$LR1$p.value)),
+      f(AIC(m_sem), 0)))
+save_csv(table3, "table3_deprivation_models")
+kable(table3, align = "lcc",
+      caption = paste0("Table 3. Models of signed CCJ surprise in MSOAs (N = ", f(n_msoa, 0),
+                       "). Coefficients with standard errors in parentheses; reference region London. ",
+                       "* p < .05, ** p < .01, *** p < .001."))
+```
+
+```{r rq2-checks}
+c_lmm   <- tidy(m_lmm, effects = "fixed", conf.int = TRUE) %>% filter(term == "dep_10")
+c_logit <- tidy(m_logit, effects = "fixed", conf.int = TRUE, exponentiate = TRUE) %>% filter(term == "dep_10")
+c_ols   <- tidy(m_ols, conf.int = TRUE) %>% filter(term == "dep_10")
+
+rq2_checks <- tibble(
+  model = c("OLS, region fixed effects (Model 1)", "Linear mixed model, region random intercept",
+            "Logistic mixed model of positive surprise (odds ratio)"),
+  estimate = c(c_ols$estimate, c_lmm$estimate, c_logit$estimate),
+  conf.low = c(c_ols$conf.low, c_lmm$conf.low, c_logit$conf.low),
+  conf.high = c(c_ols$conf.high, c_lmm$conf.high, c_logit$conf.high),
+  statistic = c(c_ols$statistic, c_lmm$statistic, c_logit$statistic),
+  p.value = c(c_ols$p.value, c_lmm$p.value, c_logit$p.value),
+  region_icc = c(NA, icc_lmm, icc_logit))
+save_csv(rq2_checks, "rq2_checks")
+rq2_checks %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+In the main model, each 10 percentage point increase in deprivation is associated with a `r f(t_sem$estimate[t_sem$term == "dep_10"], 3)` increase in signed surprise (SE = `r f(t_sem$std.error[t_sem$term == "dep_10"], 4)`, p `r fp(t_sem$p.value[t_sem$term == "dep_10"])`). The spatial error term is significant (λ = `r f(m_sem$lambda)`, SE = `r f(m_sem$lambda.se)`) and improves fit (AIC `r f(AIC(m_sem), 0)` vs `r f(AIC(m_ols), 0)`). In the linear mixed model the estimate is `r f(c_lmm$estimate, 3)` (95% CI `r f(c_lmm$conf.low, 3)` to `r f(c_lmm$conf.high, 3)`), and region accounts for `r f(icc_lmm * 100, 0)`% of the variance (ICC = `r f(icc_lmm)`). In the logistic mixed model, each 10-point increase raises the odds of positive surprise by `r f((c_logit$estimate - 1) * 100, 0)`% (OR = `r f(c_logit$estimate)`, 95% CI `r f(c_logit$conf.low)` to `r f(c_logit$conf.high)`). The residuals of the linear mixed model are spatially autocorrelated (Moran's I = `r f(moran_lmm$statistic, 3)`, permutation p = `r f(moran_lmm$p.value, 3)`).
+
+# RQ3: Companies in trouble and environmental enforcement
+
+Enforcement actions are too sparse for count models: zero-inflated negative binomial models were unstable. We therefore model whether an MSOA had at least one enforcement action. The main model is a logistic regression with signed surprise and deprivation as predictors and region fixed effects, for the same reason as in RQ2: nine regions are too few to estimate a between-region variance reliably. As a check, we fit a logistic mixed model with a random intercept for region. We also test the residuals of the main model for spatial autocorrelation.
+
+```{r rq3-models}
+# Main model: logistic regression with region fixed effects
+m_ea <- glm(ea_any ~ signed_surprise + dep_10 + RGN22NM, family = binomial, data = msoa_data)
+# Check: logistic mixed model with a random intercept for region
+m_ea_re <- glmer(ea_any ~ signed_surprise + dep_10 + (1 | RGN22NM), family = binomial, data = msoa_data)
+moran_ea <- moran.mc(residuals(m_ea, type = "pearson"), lw, nsim = 999, zero.policy = TRUE)
+
+t_ea  <- tidy(m_ea)
+t_ea$conf.low  <- t_ea$estimate - qnorm(.975) * t_ea$std.error
+t_ea$conf.high <- t_ea$estimate + qnorm(.975) * t_ea$std.error
+g     <- function(term, col) t_ea[[col]][t_ea$term == term]
+sd_s  <- sd(msoa_data$signed_surprise)
+
+# Predicted probability of any enforcement at the quartiles of surprise, for an
+# MSOA with no deprived LSOAs, averaged over the observed regions
+q_s <- quantile(msoa_data$signed_surprise, c(.25, .75))
+pred_at <- function(s) mean(predict(m_ea, type = "response",
+  newdata = st_drop_geometry(msoa_data) %>% mutate(signed_surprise = s, dep_10 = 0)))
+pred <- sapply(q_s, pred_at)
+
+# Descriptive: enforcement by sign of surprise
+ea_by_sign <- msoa_data %>% st_drop_geometry() %>%
+  group_by(surprise = ifelse(signed_surprise > 0, "More CCJs than expected", "Fewer CCJs than expected")) %>%
+  summarise(msoas = n(), with_enforcement = sum(ea_any), pct = mean(ea_any) * 100, .groups = "drop")
+save_csv(ea_by_sign, "rq3_enforcement_by_surprise")
+ea_by_sign
+```
+
+```{r table4}
+or_ci <- function(b, lo, hi) paste0(f(exp(b)), " [", f(exp(lo)), ", ", f(exp(hi)), "]")
+pfmt  <- function(p) ifelse(p < .001, "< .001", sub("^0", "", sprintf("%.3f", p)))
+row4  <- function(label, term) tibble(
+  ` ` = label,
+  `b (SE)` = paste0(f(g(term, "estimate"), 3), " (", f(g(term, "std.error"), 3), ")"),
+  `OR [95% CI]` = or_ci(g(term, "estimate"), g(term, "conf.low"), g(term, "conf.high")),
+  p = pfmt(g(term, "p.value")))
+
+table4 <- bind_rows(
+  row4("Intercept (London)", "(Intercept)"),
+  row4("Signed CCJ surprise", "signed_surprise"),
+  row4("Deprivation (per 10 percentage points)", "dep_10"),
+  bind_rows(lapply(reg_order, function(r) row4(paste0("Region: ", r), paste0("RGN22NM", r)))),
+  tibble(` ` = "AIC", `b (SE)` = f(AIC(m_ea), 0), `OR [95% CI]` = "", p = ""))
+save_csv(table4, "table4_enforcement_model")
+kable(table4, align = "lccc",
+      caption = paste0("Table 4. Logistic regression of at least one Environment Agency enforcement ",
+                       "action in an MSOA, 2015–2017, with region fixed effects (N = ", f(n_msoa, 0),
+                       "). Reference region London."))
+
+t_re  <- tidy(m_ea_re, effects = "fixed", conf.int = TRUE)
+re_sd <- sqrt(as.data.frame(VarCorr(m_ea_re))$vcov[1])
+rq3_checks <- tibble(
+  statistic = c("Surprise OR per SD of surprise (main model)", "SD of signed surprise",
+                "Predicted probability at lower quartile of surprise",
+                "Predicted probability at upper quartile of surprise",
+                "Lower quartile of surprise", "Upper quartile of surprise",
+                "Mixed model check: surprise OR", "Mixed model check: deprivation OR",
+                "Mixed model check: region ICC (latent scale)",
+                "Moran's I, residuals of main model", "Moran's I permutation p"),
+  value = c(exp(g("signed_surprise", "estimate") * sd_s), sd_s, pred[1], pred[2], q_s[1], q_s[2],
+            exp(t_re$estimate[t_re$term == "signed_surprise"]), exp(t_re$estimate[t_re$term == "dep_10"]),
+            re_sd^2 / (re_sd^2 + pi^2 / 3), unname(moran_ea$statistic), moran_ea$p.value))
+save_csv(rq3_checks, "rq3_checks")
+rq3_checks %>% mutate(value = round(value, 3))
+```
+
+Signed surprise is positively associated with enforcement (OR = `r f(exp(g("signed_surprise", "estimate")))`, 95% CI `r f(exp(g("signed_surprise", "conf.low")))` to `r f(exp(g("signed_surprise", "conf.high")))`). Because surprise spans only about one unit, a more interpretable contrast is one standard deviation (`r f(sd_s)`), which is associated with `r f((exp(g("signed_surprise", "estimate") * sd_s) - 1) * 100, 0)`% higher odds of enforcement. For an MSOA with no deprived LSOAs, the predicted probability of at least one action rises from `r f(pred[1] * 100, 0)`% at the lower quartile of surprise to `r f(pred[2] * 100, 0)`% at the upper quartile. Holding surprise constant, deprivation has a small negative association with enforcement (OR = `r f(exp(g("dep_10", "estimate")))`, 95% CI `r f(exp(g("dep_10", "conf.low")))` to `r f(exp(g("dep_10", "conf.high")))`). The mixed model gives near-identical estimates (surprise OR = `r f(exp(t_re$estimate[t_re$term == "signed_surprise"]))`; deprivation OR = `r f(exp(t_re$estimate[t_re$term == "dep_10"]))`). The residuals of the main model show weak spatial autocorrelation (Moran's I = `r f(moran_ea$statistic, 3)`, permutation p = `r f(moran_ea$p.value, 3)`).
+
+# Publication figures
+
+The figures are saved as vector PDFs: each figure as one combined file, and each panel separately.
+
+```{r save-figures}
+save_pdf <- function(plot, name, width, height) {
+  ggsave(file.path(paths$figures, paste0(name, ".pdf")), plot, width = width, height = height)
+}
+save_pdf(wrap_plots(fig1, nrow = 1), "figure1_regions", 7.5, 3.6)
+save_pdf(wrap_plots(fig2, nrow = 1), "figure2_london", 7.5, 3.0)
+for (nm in names(fig1)) save_pdf(fig1[[nm]], paste0("figure1_regions_", nm), 3, 3.6)
+for (nm in names(fig2)) save_pdf(fig2[[nm]], paste0("figure2_london_", nm), 3.5, 3.2)
+```
+
+# Appendix A: how the enforcement dataset was built
+
+We built a dataset that used both criminal and regulatory justice outcomes. The enforcement dataset (`data/enforcement/ea_enforcement_actions_2015_2017.csv`) was compiled by hand from two sources:
+
+1. **The Environment Agency enforcement database.** We searched it for all enforcement actions against companies decided in 2015–2017, which yielded enforcement notices and prosecutions.
+2. **[Violation Tracker UK](https://violationtrackeruk.goodjobsfirst.org/).** We searched it for Environment Agency actions in the same period. This added civil penalties and enforcement undertakings that are not recorded in the EA database.
+
+Environment agency had addresses which violation tracker didn't have. There were actions missing from both datasets in that there were some not in the EA database but VT had from FOIs and then there were some in the EA database that VT didn't have. So it was necessary to combine both these to get complete picture. 
+
+We then cleaned the records:
+
+- Records from the two sources were combined, and duplicates were removed.
+- Multiple outcomes decided on the same date against a single company were counted as one action (for example, a conviction for five offences in a combined prosecution).
+- Where the source record did not include the company's address, we traced it through the company's Companies House entry at the time of the decision.
+- Addresses were geocoded with OpenStreetMap Nominatim, falling back to ArcGIS where Nominatim found no match. The results were checked on a map, and six records were corrected by hand (`data/enforcement/manual_coordinate_corrections.csv`, with the reason for each).
+
+The code below documents the geocoding step. It is **not run** when this document is knitted: geocoding services change over time, so re-running it may give slightly different coordinates from the published ones. To run it, install `tidygeocoder` and set `eval = TRUE`.
+
+```{r geocoding, eval = FALSE}
+library(tidygeocoder)
+
+ea_raw <- read.csv(paths$ea) %>% select(-latitude, -longitude)
+addresses <- ea_raw %>% distinct(address)
+
+# 1. OpenStreetMap Nominatim (rate-limited to one request per second)
+geo_osm <- addresses %>% geocode(address, method = "osm", lat = latitude, long = longitude)
+
+# 2. ArcGIS for addresses that Nominatim could not match
+geo_arcgis <- geo_osm %>% filter(is.na(latitude)) %>% select(address) %>%
+  geocode(address, method = "arcgis", lat = latitude, long = longitude)
+
+coords <- bind_rows(geo_osm %>% filter(!is.na(latitude)), geo_arcgis)
+
+# 3. Manual corrections, checked on a map
+corrections <- read.csv("data/enforcement/manual_coordinate_corrections.csv")
+ea_geocoded <- ea_raw %>%
+  left_join(coords, by = "address") %>%
+  left_join(corrections %>% select(offender, lat_fix = latitude, lon_fix = longitude), by = "offender") %>%
+  mutate(latitude = coalesce(lat_fix, latitude), longitude = coalesce(lon_fix, longitude)) %>%
+  select(-lat_fix, -lon_fix)
+```
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
+
+

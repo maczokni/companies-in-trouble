@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this code or the Environment Agency enforcement dataset, please cite the paper."
+title: "Companies in Trouble: replication materials"
+type: software
+license: MIT
+authors:
+  - family-names: Solymosi
+    given-names: Reka
+    affiliation: University of Manchester
+  - family-names: Jordanoska
+    given-names: Aleksandra
+    affiliation: Kings College London
+preferred-citation:
+  type: article
+  title: "Companies in Trouble: Does Place Matter for Corporate Strain?"  
+  journal: "Journal of Criminal Justice"
+  status: submitted
+  authors:
+    - family-names: Solymosi
+      given-names: Reka
+    - family-names: Jordanoska
+      given-names: Aleksandra

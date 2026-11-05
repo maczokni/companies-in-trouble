@@ -1,0 +1,25 @@
+# ---- Restricted CCJ data: must never be committed ---------------------------
+data/restricted/*
+!data/restricted/README.md
+
+# Rendered report, tables, figures and caches contain results derived from
+# the restricted CCJ data
+outputs/
+*.html
+
+# Large open boundary files (download instructions in data/boundaries/README.md)
+data/boundaries/*
+!data/boundaries/README.md
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.httr-oauth
+analysis_files/
+analysis_cache/
+
+# OS files
+.DS_Store
+Icon?
