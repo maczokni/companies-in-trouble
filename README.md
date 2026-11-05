@@ -105,3 +105,7 @@ The rendered report is written to `outputs/analysis.html`, tables to `outputs/ta
 ## Citation
 
 If you use this code or the enforcement dataset, please cite the paper (full reference to be added on publication). See [`CITATION.cff`](CITATION.cff).
+
+## Use of AI
+
+The authors designed the study, carried out the data collection and analysis, and wrote the paper. We used an AI assistant (Claude, Anthropic) to help build this repository. It turned our analysis scripts into a single R Markdown document, tidied the code, drafted the documentation, and found and fixed bugs. We reviewed and tested every change and take full responsibility for the code and results.
